@@ -12,6 +12,7 @@ from datetime import datetime
 # CONFIGURATION & ENVIRONMENT SETUP
 # ==============================================================================
 CACHE_FILE = f"/tmp/adb_contacts_cache_{os.getlogin()}.json"
+DEFAULT_DEVICE_LOG_FILE = '/sdcard/Documents/sent_sms.txt'
 
 def run_adb(args):
     """Executes an ADB command safely and returns standard output strings."""
@@ -30,7 +31,7 @@ def run_adb(args):
 # CONTACT CACHE MATRIX LOGIC
 # ==============================================================================
 def build_contacts_cache(force=False):
-    """Queries phone book entries and serializes them into a local JSON map."""
+    """Queries phone book entries and serializes them into a local JSON map using explicit string keys."""
     if not force and os.path.exists(CACHE_FILE) and os.path.getsize(CACHE_FILE) > 0:
         with open(CACHE_FILE, 'r') as f:
             return json.load(f)
@@ -45,34 +46,42 @@ def build_contacts_cache(force=False):
             
             if name_match and num_match:
                 name = name_match.group(1).strip()
-                # Extract numbers only to create a uniform lookup key
-                num = re.sub(r'\D', '', num_match.group(1))
-                if num.startswith("1") and len(num) == 11:
-                    num = num[1:]
+                raw_num = re.sub(r'\D', '', num_match.group(1))
                 
-                if name and num:
-                    contacts[name.lower()] = {"name": name, "number": num}
-                    contacts[num] = {"name": name, "number": num}
+                # Explicitly force the 10-digit segment as a clean string key
+                num_10 = str(raw_num[-10:] if len(raw_num) >= 10 else raw_num)
+                
+                if name and num_10:
+                    # Store alphabetical key
+                    contacts[name.lower()] = {"name": name, "number": num_10}
+                    # Store 10-digit key strictly as a string entry
+                    contacts[num_10] = {"name": name, "number": num_10}
 
     with open(CACHE_FILE, 'w') as f:
         json.dump(contacts, f, indent=4)
     return contacts
 
-def resolve_target(target, cache):
-    """Translates either a name string or a raw number using the local cache mapping."""
-    target_clean = target.strip()
-    
+def get_contact(target, cache):
+    """
+    Looks up a target (name or number) in the cache.
+    Returns the entry dict {"name": "...", "number": "..."} if found, or None.
+    """
+    target_clean = str(target).strip()
+    if not target_clean:
+        return None
+
+    # Case 1: Try checking as an alphabetical contact name key
     if target_clean.lower() in cache:
-        return cache[target_clean.lower()]["number"]
-        
+        return cache[target_clean.lower()]
+
+    # Case 2: Try checking as a phone number key normalized to 10 digits
     num_only = re.sub(r'\D', '', target_clean)
-    if num_only.startswith("1") and len(num_only) == 11:
-        num_only = num_only[1:]
-        
-    if num_only in cache:
-        return cache[num_only]["name"]
-        
-    return target
+    num_10 = num_only[-10:] if len(num_only) >= 10 else num_only
+    
+    if num_10 in cache:
+        return cache[num_10]
+
+    return None
 
 # ==============================================================================
 # DEVICE FILE APPEND LOGGER
@@ -105,33 +114,45 @@ def cmd_send(args, cache):
     target = args.target
     message = args.message
     
-    resolved = resolve_target(target, cache)
+    # Check our new dictionary-returning lookup function
+    contact = get_contact(target, cache)
     
-    # Clean up phone number variables
-    clean_num = re.sub(r'\D', '', resolved)
+    if contact:
+        # Match found: use the clean 10-digit number from the cache
+        resolved_number = contact["number"]
+        display_name = contact["name"]
+    else:
+        # No match: Check if the user passed a raw phone number or a broken contact name
+        # If the target string contains any alphabetic characters, it's an invalid contact name
+        if re.search(r'[a-zA-Z]', target):
+            print(f"[-] Error: '{target}' does not exist in your contacts cache.", file=sys.stderr)
+            print("    Run './adb_sms.py contacts' to verify your available mappings.", file=sys.stderr)
+            sys.exit(1)
+            
+        # If it doesn't contain letters, treat it as a raw phone number input
+        resolved_number = target
+        display_name = "Unknown Contact"
+    
+    # Standardize the final destination number for the cellular radio layer
+    clean_num = re.sub(r'\D', '', resolved_number)
     if len(clean_num) == 10:
         clean_num = f"+1{clean_num}"
     elif len(clean_num) == 11 and clean_num.startswith("1"):
         clean_num = f"+{clean_num}"
 
-    display_name = target if target.lower() in cache else resolve_target(clean_num, cache)
-    if display_name == clean_num:
-        display_name = "Unknown Contact"
-
     print(f"[*] Delivering message to {display_name} ({clean_num})...")
     
-    # Bulletproof the text string using shlex.quote for the remote Android shell environment
-    # This turns "It's" into "'It'\''s'" automatically so the shell parses it perfectly
+    # Escape the message string securely for the remote shell environment
     escaped_message = shlex.quote(message)
     
-    # We drop the manual single quotes from f"'{message}'" and use our safely escaped string instead
+    # Execute the hardware transaction over the ADB pipe
     run_adb(["shell", "service", "call", "isms", "5", "i32", "1", 
              "s16", "com.android.mms", "s16", "null", 
              "s16", clean_num, "s16", "null", 
              "s16", escaped_message, "s16", "null", "s16", "null", 
              "i32", "0", "i64", "0"])
     
-    # Handle the device tracking append routine
+    # Handle the device text file tracking append routine
     if args.device_log.lower() != 'none':
         log_to_device(args.device_log, display_name, clean_num, message)
         print(f"[+] Message sent and logged to device at: {args.device_log}")
@@ -153,14 +174,24 @@ def cmd_inbox(args, cache):
             body_m = re.search(r'body=([^,]+)', line)
             date_m = re.search(r'date=([^,]+)', line)
 
-            sender = sender_m.group(1).strip() if sender_m else "Unknown"
+            raw_sender = sender_m.group(1).strip() if sender_m else "Unknown"
             body = body_m.group(1) if body_m else ""
             raw_date = date_m.group(1).strip() if date_m else ""
 
-            display_sender = resolve_target(sender, cache)
-            if display_sender != sender:
-                display_sender = f"{display_sender} ({sender})"
+            # Extract the core 10 digits from the incoming sender address
+            clean_sender_digits = re.sub(r'\D', '', raw_sender)
+            sender_10 = clean_sender_digits[-10:] if len(clean_sender_digits) >= 10 else clean_sender_digits
 
+            # Resolve using our clean 10-digit string
+            contact = get_contact(sender_10, cache)
+            if contact:
+                # If found, make it look nice: "Jane Doe (+11234567890)"
+                display_sender = f"{contact['name']} ({raw_sender})"
+            else:
+                # Fallback case: just print the raw number "+11234567890"
+                display_sender = raw_sender
+
+            # Date translation formatting
             formatted_date = "Unknown"
             if raw_date.isdigit():
                 unix_secs = int(raw_date) / 1000
@@ -168,6 +199,7 @@ def cmd_inbox(args, cache):
 
             output_line = f"[{formatted_date}] \033[1;32m{display_sender}\033[0m: {body}"
             
+            # The filter now successfully evaluates against the resolved contact name
             if args.filter:
                 if args.filter.lower() in output_line.lower():
                     output_lines.append(output_line)
@@ -177,7 +209,6 @@ def cmd_inbox(args, cache):
             if len(output_lines) >= 12:
                 break
 
-    # Reverse back to maintain proper prompt base views
     for line in reversed(output_lines):
         print(line)
 
@@ -200,7 +231,7 @@ def main():
     # Global flag adjustments
     parser.add_argument(
         "--device-log", 
-        default="/sdcard/Documents/sent_sms.txt",
+        default=DEFAULT_DEVICE_LOG_FILE,
         help="Target text path on device for historical logging. Pass 'none' to disable entirely."
     )
     parser.add_argument(
@@ -230,7 +261,7 @@ def main():
         if os.path.exists(CACHE_FILE):
             os.remove(CACHE_FILE)
         print("[+] Contacts dictionary cache cleared.")
-        sys.exit(0)
+        # sys.exit(0)
 
     if not args.command:
         parser.print_help()
